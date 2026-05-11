@@ -1,0 +1,17 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "coder"
+version = "0.1.0"
+description = "Autonomous AI Coding Agent"
+authors = [{ name = "AI Coder" }]
+dependencies = [
+    "pydantic>=2.0.0",
+    "google-genai>=0.1.0"
+]
+requires-python = ">=3.9"
+
+[project.scripts]
+coder = "coder.__main__:main"
