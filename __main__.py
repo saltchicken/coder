@@ -2,9 +2,18 @@ import os
 import re
 import argparse
 import sys
+from pydantic import BaseModel
 from google import genai
 from google.genai import types
 from google.genai.types import HttpOptions
+
+# --- Pydantic Schema for Iterative Planning ---
+class FilePlan(BaseModel):
+    filepath: str
+    purpose: str
+
+class ProjectArchitecture(BaseModel):
+    files: list[FilePlan]
 
 # 1. The Strict Formatting Contract
 # We explicitly tell the model how to structure its output and forbid any conversational filler.
@@ -57,6 +66,77 @@ def extract_and_save_files(ai_response_text: str, output_dir: str = "generated_w
             
         print(f" -> Saved: {file_path}")
 
+def generate_iteratively(client, prompt: str, output_dir: str):
+    """
+    Two-phase generation: plans the architecture first, then generates each file individually.
+    """
+    print("\n[Phase 1] Planning Project Architecture...")
+    
+    arch_config = types.GenerateContentConfig(
+        temperature=0.2,
+        response_mime_type="application/json",
+        response_schema=ProjectArchitecture,
+        system_instruction="You are a senior software architect. Given a project request, output the necessary file structure. Provide the relative filepath and a brief purpose for each file."
+    )
+    
+    try:
+        arch_response = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=prompt,
+            config=arch_config
+        )
+        architecture = arch_response.parsed
+    except Exception as e:
+        print(f"Failed to generate architecture: {e}")
+        return
+
+    print(f"[Phase 1 Complete] Planned {len(architecture.files)} files.\n")
+    
+    # Configuration for Phase 2 (Strict XML formatting for the code)
+    code_config = types.GenerateContentConfig(
+        temperature=0.1,
+        max_output_tokens=8192,
+        system_instruction=SYSTEM_INSTRUCTION
+    )
+
+    print("[Phase 2] Generating Files...")
+    accumulated_context = ""
+    
+    for file_plan in architecture.files:
+        print(f" -> Generating {file_plan.filepath}...")
+        
+        # Build a highly contextual prompt for this specific file
+        file_prompt = (
+            f"Overall Project Context: {prompt}\n\n"
+            f"Task: Write the complete, runnable code for the file: '{file_plan.filepath}'.\n"
+            f"Purpose of this file: {file_plan.purpose}\n"
+        )
+        
+        if accumulated_context:
+            file_prompt += f"\nCode already generated for this project that you can import/use:\n{accumulated_context}\n"
+        
+        try:
+            file_response = client.models.generate_content(
+                model="gemini-2.5-flash",
+                contents=file_prompt,
+                config=code_config
+            )
+            
+            if file_response.candidates[0].finish_reason != 'STOP':
+                print(f"    WARNING: {file_plan.filepath} generation cut off! Reason: {file_response.candidates[0].finish_reason}")
+            
+            # Use our existing, robust extraction logic
+            extract_and_save_files(file_response.text, output_dir=output_dir)
+            
+            # Extract the raw code to add to our running memory for the next file
+            pattern = re.compile(r'<file name="([^"]+)">\s*```[^\n]*\n(.*?)\n```\s*</file>', re.DOTALL)
+            matches = pattern.findall(file_response.text)
+            for filename, code in matches:
+                accumulated_context += f"\n--- {filename} ---\n{code}\n"
+            
+        except Exception as e:
+            print(f"    Error generating {file_plan.filepath}: {e}")
+
 def main():
     parser = argparse.ArgumentParser(description="Autonomous AI Coding Agent")
     parser.add_argument("prompt", help="The coding task for the AI to complete")
@@ -64,6 +144,8 @@ def main():
                         help="Google Cloud Project ID (defaults to GOOGLE_CLOUD_PROJECT env var)")
     parser.add_argument("--outdir", default="generated_workspace", 
                         help="The folder where generated files will be saved")
+    parser.add_argument("--iterative", action="store_true", 
+                        help="Enable iterative generation for massive projects")
     args = parser.parse_args()
 
     # 2. Initialize the Client (Vertex AI / ADC)
@@ -87,23 +169,28 @@ def main():
 
     print(f"Generating code... (Target: ./{args.outdir}/)")
     
-    try:
-        response = client.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=args.prompt,
-            config=config
-        )
-    except Exception as e:
-        print(f"API Error: Request to Vertex AI failed. \nDetails: {e}")
-        sys.exit(1)
+    if args.iterative:
+        # Route to the new iterative pipeline
+        generate_iteratively(client, args.prompt, args.outdir)
+    else:
+        # Standard Single-Shot pipeline
+        try:
+            response = client.models.generate_content(
+                model="gemini-2.5-flash",
+                contents=args.prompt,
+                config=config
+            )
+        except Exception as e:
+            print(f"API Error: Request to Vertex AI failed. \nDetails: {e}")
+            sys.exit(1)
 
-    # 4. Check for truncation before processing
-    if response.candidates[0].finish_reason != 'STOP':
-        print(f"WARNING: Generation did not finish normally! Reason: {response.candidates[0].finish_reason}")
-        print("Attempting to parse whatever was generated so far...")
-    
-    # 5. Extract and save
-    extract_and_save_files(response.text, output_dir=args.outdir)
+        # 4. Check for truncation before processing
+        if response.candidates[0].finish_reason != 'STOP':
+            print(f"WARNING: Generation did not finish normally! Reason: {response.candidates[0].finish_reason}")
+            print("Attempting to parse whatever was generated so far...")
+        
+        # 5. Extract and save
+        extract_and_save_files(response.text, output_dir=args.outdir)
 
 if __name__ == "__main__":
     main()
