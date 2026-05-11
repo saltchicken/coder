@@ -33,7 +33,7 @@ You MUST wrap every single file you generate using the following strict XML/Mark
 If you generate multiple files, output them sequentially using this exact block structure.
 """
 
-def extract_and_save_files(ai_response_text: str, output_dir: str = "generated_workspace"):
+def extract_and_save_files(ai_response_text: str, output_dir: str = "generated_workspace", auto_save: bool = False):
     """
     Parses the AI's XML/Markdown hybrid output and writes the files to disk.
     """
@@ -51,7 +51,25 @@ def extract_and_save_files(ai_response_text: str, output_dir: str = "generated_w
         print("Raw response:\n", ai_response_text)
         return
 
-    print(f"Found {len(matches)} file(s). Writing to './{output_dir}'...")
+    print(f"\nFound {len(matches)} file(s):")
+    for filename, _ in matches:
+        print(f"  - {filename}")
+
+    if not auto_save:
+        while True:
+            choice = input("\nOptions: [p]review content, [s]ave files, [a]bort: ").strip().lower()
+            if choice == 'p':
+                for filename, code in matches:
+                    print(f"\n{'='*40}\nFILE: {filename}\n{'='*40}\n{code}\n")
+            elif choice == 's':
+                break
+            elif choice == 'a':
+                print("Aborted saving these files.")
+                return
+            else:
+                print("Invalid choice. Please enter 'p', 's', or 'a'.")
+
+    print(f"Writing to './{output_dir}'...")
 
     for filename, code in matches:
         # Construct the full path
@@ -66,7 +84,7 @@ def extract_and_save_files(ai_response_text: str, output_dir: str = "generated_w
             
         print(f" -> Saved: {file_path}")
 
-def generate_iteratively(client, prompt: str, output_dir: str):
+def generate_iteratively(client, prompt: str, output_dir: str, auto_save: bool):
     """
     Two-phase generation: plans the architecture first, then generates each file individually.
     """
@@ -126,7 +144,7 @@ def generate_iteratively(client, prompt: str, output_dir: str):
                 print(f"    WARNING: {file_plan.filepath} generation cut off! Reason: {file_response.candidates[0].finish_reason}")
             
             # Use our existing, robust extraction logic
-            extract_and_save_files(file_response.text, output_dir=output_dir)
+            extract_and_save_files(file_response.text, output_dir=output_dir, auto_save=auto_save)
             
             # Extract the raw code to add to our running memory for the next file
             pattern = re.compile(r'<file name="([^"]+)">\s*```[^\n]*\n(.*?)\n```\s*</file>', re.DOTALL)
@@ -146,6 +164,8 @@ def main():
                         help="The folder where generated files will be saved")
     parser.add_argument("--iterative", action="store_true", 
                         help="Enable iterative generation for massive projects")
+    parser.add_argument("-y", "--yes", action="store_true",
+                        help="Skip confirmation prompts and auto-save files")
     args = parser.parse_args()
 
     # 2. Initialize the Client (Vertex AI / ADC)
@@ -171,7 +191,7 @@ def main():
     
     if args.iterative:
         # Route to the new iterative pipeline
-        generate_iteratively(client, args.prompt, args.outdir)
+        generate_iteratively(client, args.prompt, args.outdir, auto_save=args.yes)
     else:
         # Standard Single-Shot pipeline
         try:
@@ -190,7 +210,7 @@ def main():
             print("Attempting to parse whatever was generated so far...")
         
         # 5. Extract and save
-        extract_and_save_files(response.text, output_dir=args.outdir)
+        extract_and_save_files(response.text, output_dir=args.outdir, auto_save=args.yes)
 
 if __name__ == "__main__":
     main()
