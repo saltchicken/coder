@@ -1,5 +1,7 @@
 import os
 import re
+import argparse
+import sys
 from google import genai
 from google.genai import types
 from google.genai.types import HttpOptions
@@ -28,10 +30,10 @@ def extract_and_save_files(ai_response_text: str, output_dir: str = "generated_w
     """
     # Regex Breakdown:
     # <file name="([^"]+)">  -> Captures the filename inside the quotes (Group 1)
-    # \s*```[a-zA-Z0-9]*\n   -> Matches optional whitespace, the ``` backticks, and the language name (e.g. python)
+    # \s*```[^\n]*\n         -> Matches optional whitespace, ```, any language tag, and the newline
     # (.*?)                  -> Captures the actual raw code block (Group 2), non-greedy
     # \n```\s*</file>        -> Matches the closing backticks and the closing XML tag
-    pattern = re.compile(r'<file name="([^"]+)">\s*```[a-zA-Z0-9]*\n(.*?)\n```\s*</file>', re.DOTALL)
+    pattern = re.compile(r'<file name="([^"]+)">\s*```[^\n]*\n(.*?)\n```\s*</file>', re.DOTALL)
     
     matches = pattern.findall(ai_response_text)
     
@@ -56,13 +58,25 @@ def extract_and_save_files(ai_response_text: str, output_dir: str = "generated_w
         print(f" -> Saved: {file_path}")
 
 def main():
+    parser = argparse.ArgumentParser(description="Autonomous AI Coding Agent")
+    parser.add_argument("prompt", help="The coding task for the AI to complete")
+    parser.add_argument("--project", default=os.environ.get("GOOGLE_CLOUD_PROJECT"),
+                        help="Google Cloud Project ID (defaults to GOOGLE_CLOUD_PROJECT env var)")
+    parser.add_argument("--outdir", default="generated_workspace", 
+                        help="The folder where generated files will be saved")
+    args = parser.parse_args()
+
     # 2. Initialize the Client (Vertex AI / ADC)
-    client = genai.Client(
-        vertexai=True,
-        project="coder-470",
-        location="us-central1",
-        http_options=HttpOptions(api_version="v1")
-    )
+    try:
+        client = genai.Client(
+            vertexai=True,
+            project=args.project,
+            location="us-central1",
+            http_options=HttpOptions(api_version="v1")
+        )
+    except Exception as e:
+        print(f"Authentication Error: Could not initialize client. Are you logged into gcloud? \nDetails: {e}")
+        sys.exit(1)
 
     # 3. Configure the model parameters
     config = types.GenerateContentConfig(
@@ -71,21 +85,25 @@ def main():
         system_instruction=SYSTEM_INSTRUCTION
     )
 
-    prompt = "Create a Python script called 'scraper.py' that fetches a URL, and a 'requirements.txt' file with the necessary libraries."
+    print(f"Generating code... (Target: ./{args.outdir}/)")
     
-    print("Sending request to Gemini...")
-    response = client.models.generate_content(
-        model="gemini-2.5-flash",
-        contents=prompt,
-        config=config
-    )
+    try:
+        response = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=args.prompt,
+            config=config
+        )
+    except Exception as e:
+        print(f"API Error: Request to Vertex AI failed. \nDetails: {e}")
+        sys.exit(1)
 
     # 4. Check for truncation before processing
     if response.candidates[0].finish_reason != 'STOP':
         print(f"WARNING: Generation did not finish normally! Reason: {response.candidates[0].finish_reason}")
-    else:
-        # 5. Extract and save
-        extract_and_save_files(response.text)
+        print("Attempting to parse whatever was generated so far...")
+    
+    # 5. Extract and save
+    extract_and_save_files(response.text, output_dir=args.outdir)
 
 if __name__ == "__main__":
     main()
