@@ -3,6 +3,7 @@ import re
 import argparse
 import sys
 import logging
+import difflib
 from typing import Literal
 from pydantic import BaseModel, Field
 from google import genai
@@ -82,11 +83,56 @@ def old_function():
 You can include multiple <search>/<replace> pairs within a single <file action="edit"> block to modify multiple parts of the same file.
 """
 
+def generate_colorized_diff(original_text: str, new_text: str, filename: str) -> str:
+    """Generates a git-style colorized unified diff string."""
+    original_lines = original_text.splitlines(keepends=True)
+    new_lines = new_text.splitlines(keepends=True)
+    
+    diff = list(difflib.unified_diff(
+        original_lines, new_lines,
+        fromfile=f"a/{filename}",
+        tofile=f"b/{filename}",
+        n=3 # Context lines
+    ))
+    
+    if not diff:
+        return "\033[90mNo changes detected.\033[0m"
+
+    colorized_diff = []
+    for line in diff:
+        if line.startswith('+') and not line.startswith('+++'):
+            colorized_diff.append(f"\033[92m{line}\033[0m") # Green for additions
+        elif line.startswith('-') and not line.startswith('---'):
+            colorized_diff.append(f"\033[91m{line}\033[0m") # Red for deletions
+        elif line.startswith('@@'):
+            colorized_diff.append(f"\033[96m{line}\033[0m") # Cyan for chunks
+        else:
+            colorized_diff.append(line)
+            
+    return "".join(colorized_diff)
+
+def get_user_input(prompt_text: str) -> str:
+    """Gets user input even if sys.stdin is piped."""
+    if sys.stdin.isatty():
+        return input(prompt_text)
+    
+    # When stdin is piped, input() throws EOFError. Read directly from terminal.
+    print(prompt_text, end='', flush=True)
+    try:
+        if os.name == 'nt':
+            with open('CONIN$', 'r') as con:
+                return con.readline().strip()
+        else:
+            with open('/dev/tty', 'r') as tty:
+                return tty.readline().strip()
+    except OSError:
+        raise EOFError("Could not open terminal for input.")
+
 def extract_and_save_files(ai_response_text: str, output_dir: str = "generated_workspace", auto_save: bool = False):
     """
     Parses the AI's XML/Markdown hybrid output for both full files and partial edits.
+    Applies changes in memory first to generate previews.
     """
-    # Regex to find <file name="..." action="...">...</file>
     file_pattern = re.compile(r'<file name="([^"]+)"(?:\s+action="([^"]+)")?>\s*(.*?)\s*</file>', re.DOTALL)
     matches = file_pattern.findall(ai_response_text)
     
@@ -95,52 +141,82 @@ def extract_and_save_files(ai_response_text: str, output_dir: str = "generated_w
         print("Raw response:\n", ai_response_text)
         return
 
-    proposed_changes = []
-
-    # Parse out exactly what needs to happen
+    # Phase 1: Apply all changes in-memory first
+    memory_operations = []
+    
     for filename, action, content in matches:
         action = action.lower() if action else "write"
+        file_path = os.path.join(output_dir, filename)
         
         if action == "edit":
-            # Extract search and replace pairs
+            if not os.path.exists(file_path):
+                print(f" -> ERROR: Cannot edit '{filename}' because it does not exist in {output_dir}.")
+                continue
+                
+            with open(file_path, "r", encoding="utf-8") as f:
+                original_text = f.read()
+
             edit_pattern = re.compile(r'<search>\n?(.*?)\n?</search>\s*<replace>\n?(.*?)\n?</replace>', re.DOTALL)
             edits = edit_pattern.findall(content)
-            proposed_changes.append({
-                'filename': filename,
-                'action': 'edit',
-                'edits': edits
-            })
-        else:
-            # Extract full code block
+            
+            new_text = original_text
+            success_count = 0
+            
+            for search_text, replace_text in edits:
+                if search_text in new_text:
+                    new_text = new_text.replace(search_text, replace_text)
+                    success_count += 1
+                else:
+                    print(f"\n -> \033[93mWARNING: Could not find matching <search> block in {filename}. Skipping this chunk.\033[0m")
+                    print(f"    [Looked for]: {search_text[:60].strip()}...")
+            
+            if success_count > 0:
+                memory_operations.append({
+                    'filename': filename,
+                    'path': file_path,
+                    'action': 'edit',
+                    'new_text': new_text,
+                    'diff': generate_colorized_diff(original_text, new_text, filename),
+                    'msg': f"Applied {success_count}/{len(edits)} edits"
+                })
+
+        else: # action == "write"
             code_pattern = re.compile(r'```[^\n]*\n(.*?)\n```', re.DOTALL)
             code_match = code_pattern.search(content)
-            code = code_match.group(1) if code_match else content.strip()
-            proposed_changes.append({
+            new_text = code_match.group(1) if code_match else content.strip()
+            
+            # If overwriting, show diff from existing file. Otherwise diff from empty string.
+            original_text = ""
+            if os.path.exists(file_path):
+                with open(file_path, "r", encoding="utf-8") as f:
+                    original_text = f.read()
+                    
+            memory_operations.append({
                 'filename': filename,
+                'path': file_path,
                 'action': 'write',
-                'content': code
+                'new_text': new_text,
+                'diff': generate_colorized_diff(original_text, new_text, filename),
+                'msg': f"Wrote full file"
             })
 
-    print(f"\nFound {len(proposed_changes)} file(s) to process:")
-    for change in proposed_changes:
-        action_label = "EDIT" if change['action'] == "edit" else "WRITE"
-        print(f"  - [{action_label}] {change['filename']}")
+    if not memory_operations:
+        print("No successful file operations to apply.")
+        return
 
+    print(f"\nPrepared {len(memory_operations)} file(s) for modification.")
+
+    # Phase 2: Interactive Prompt (with diffs)
     if not auto_save:
         while True:
             try:
-                choice = input("\nOptions: [p]review content, [s]ave files, [a]bort: ").strip().lower()
+                choice = get_user_input("\nOptions: [p]review diffs, [s]ave files, [a]bort: ").strip().lower()
                 if choice == 'p':
-                    for change in proposed_changes:
-                        print(f"\n{'='*50}\nFILE: {change['filename']} ({change['action'].upper()})\n{'='*50}")
-                        if change['action'] == 'write':
-                            print(change['content'])
-                        elif change['action'] == 'edit':
-                            for i, (search_text, replace_text) in enumerate(change['edits']):
-                                print(f"--- Edit #{i+1} ---")
-                                print(f"<<<< SEARCH\n{search_text}\n====")
-                                print(f">>>> REPLACE\n{replace_text}\n")
-                        print("\n")
+                    for op in memory_operations:
+                        print(f"\n{'='*60}")
+                        print(f"FILE: {op['filename']} ({op['action'].upper()})")
+                        print(f"{'='*60}")
+                        print(op['diff'])
                 elif choice == 's':
                     break
                 elif choice == 'a':
@@ -149,43 +225,16 @@ def extract_and_save_files(ai_response_text: str, output_dir: str = "generated_w
                 else:
                     print("Invalid choice. Please enter 'p', 's', or 'a'.")
             except EOFError:
-                print("\nError: Interactive prompt failed because standard input was piped. Use '-y' to bypass prompts.")
+                print("\nError: Interactive prompt failed. Use '-y' to bypass prompts.")
                 return
 
+    # Phase 3: Write to Disk
     print(f"\nApplying changes to './{output_dir}'...")
-
-    for change in proposed_changes:
-        file_path = os.path.join(output_dir, change['filename'])
-        
-        if change['action'] == 'write':
-            os.makedirs(os.path.dirname(file_path), exist_ok=True)
-            with open(file_path, "w", encoding="utf-8") as f:
-                f.write(change['content'])
-            print(f" -> Wrote full file: {file_path}")
-
-        elif change['action'] == 'edit':
-            if not os.path.exists(file_path):
-                print(f" -> ERROR: Cannot edit '{change['filename']}' because it does not exist in {output_dir}.")
-                continue
-                
-            with open(file_path, "r", encoding="utf-8") as f:
-                file_text = f.read()
-
-            new_text = file_text
-            success_count = 0
-            
-            for search_text, replace_text in change['edits']:
-                if search_text in new_text:
-                    new_text = new_text.replace(search_text, replace_text)
-                    success_count += 1
-                else:
-                    print(f" -> WARNING: Could not find matching <search> block in {change['filename']}. Skipping edit.")
-                    print(f"    [Snippet]: {search_text[:60].strip()}...")
-            
-            if success_count > 0:
-                with open(file_path, "w", encoding="utf-8") as f:
-                    f.write(new_text)
-                print(f" -> Applied {success_count}/{len(change['edits'])} edits to: {file_path}")
+    for op in memory_operations:
+        os.makedirs(os.path.dirname(op['path']), exist_ok=True)
+        with open(op['path'], "w", encoding="utf-8") as f:
+            f.write(op['new_text'])
+        print(f" -> {op['msg']}: {op['path']}")
 
 def generate_iteratively(client, prompt: str, output_dir: str, auto_save: bool):
     """
@@ -292,9 +341,6 @@ def main():
     elif not sys.stdin.isatty():
         context_data = sys.stdin.read()
         print(f"Loaded {len(context_data)} bytes of context from standard input.")
-        if not args.yes:
-            print("Notice: Piped input detected. Automatically enabling auto-save (-y) to prevent interactive prompt crash.")
-            args.yes = True
 
     final_prompt = args.prompt
     if context_data:
