@@ -57,17 +57,21 @@ def extract_and_save_files(ai_response_text: str, output_dir: str = "generated_w
 
     if not auto_save:
         while True:
-            choice = input("\nOptions: [p]review content, [s]ave files, [a]bort: ").strip().lower()
-            if choice == 'p':
-                for filename, code in matches:
-                    print(f"\n{'='*40}\nFILE: {filename}\n{'='*40}\n{code}\n")
-            elif choice == 's':
-                break
-            elif choice == 'a':
-                print("Aborted saving these files.")
+            try:
+                choice = input("\nOptions: [p]review content, [s]ave files, [a]bort: ").strip().lower()
+                if choice == 'p':
+                    for filename, code in matches:
+                        print(f"\n{'='*40}\nFILE: {filename}\n{'='*40}\n{code}\n")
+                elif choice == 's':
+                    break
+                elif choice == 'a':
+                    print("Aborted saving these files.")
+                    return
+                else:
+                    print("Invalid choice. Please enter 'p', 's', or 'a'.")
+            except EOFError:
+                print("\nError: Interactive prompt failed because standard input was piped. Use '-y' to bypass prompts.")
                 return
-            else:
-                print("Invalid choice. Please enter 'p', 's', or 'a'.")
 
     print(f"Writing to './{output_dir}'...")
 
@@ -125,7 +129,7 @@ def generate_iteratively(client, prompt: str, output_dir: str, auto_save: bool):
         
         # Build a highly contextual prompt for this specific file
         file_prompt = (
-            f"Overall Project Context: {prompt}\n\n"
+            f"Overall Project Context and Instructions: \n{prompt}\n\n"
             f"Task: Write the complete, runnable code for the file: '{file_plan.filepath}'.\n"
             f"Purpose of this file: {file_plan.purpose}\n"
         )
@@ -158,7 +162,7 @@ def generate_iteratively(client, prompt: str, output_dir: str, auto_save: bool):
 def main():
     parser = argparse.ArgumentParser(description="Autonomous AI Coding Agent")
     parser.add_argument("prompt", help="The coding task for the AI to complete")
-    parser.add_argument("--project", default=os.environ.get("GOOGLE_CLOUD_PROJECT"),
+    parser.add_argument("--project", default=os.environ.get("GOOGLE_CLOUD_PROJECT", "coder-470"),
                         help="Google Cloud Project ID (defaults to GOOGLE_CLOUD_PROJECT env var)")
     parser.add_argument("--outdir", default="generated_workspace", 
                         help="The folder where generated files will be saved")
@@ -166,9 +170,38 @@ def main():
                         help="Enable iterative generation for massive projects")
     parser.add_argument("-y", "--yes", action="store_true",
                         help="Skip confirmation prompts and auto-save files")
+    parser.add_argument("--context-file", 
+                        help="Path to an exported codebase context file (e.g., from the 'context' CLI tool)")
     args = parser.parse_args()
 
-    # 2. Initialize the Client (Vertex AI / ADC)
+    # --- Read External Context ---
+    context_data = ""
+    
+    # 1. Check if user passed a file via --context-file
+    if args.context_file:
+        try:
+            with open(args.context_file, "r", encoding="utf-8") as f:
+                context_data = f.read()
+            print(f"Loaded {len(context_data)} bytes of context from {args.context_file}")
+        except Exception as e:
+            print(f"Error reading context file: {e}")
+            sys.exit(1)
+            
+    # 2. Check if context is being piped via stdin (e.g. `context | python coder.py "prompt"`)
+    elif not sys.stdin.isatty():
+        context_data = sys.stdin.read()
+        print(f"Loaded {len(context_data)} bytes of context from standard input.")
+        # If stdin is consumed by the pipe, `input()` will crash later. We must auto-save.
+        if not args.yes:
+            print("Notice: Piped input detected. Automatically enabling auto-save (-y) to prevent interactive prompt crash.")
+            args.yes = True
+
+    # Combine the user's prompt with the codebase context
+    final_prompt = args.prompt
+    if context_data:
+        final_prompt = f"Here is the context of the existing codebase:\n\n{context_data}\n\nTask Instructions:\n{args.prompt}"
+
+    # Initialize the Client (Vertex AI / ADC)
     try:
         client = genai.Client(
             vertexai=True,
@@ -180,7 +213,7 @@ def main():
         print(f"Authentication Error: Could not initialize client. Are you logged into gcloud? \nDetails: {e}")
         sys.exit(1)
 
-    # 3. Configure the model parameters
+    # Configure the model parameters
     config = types.GenerateContentConfig(
         temperature=0.1,               # Low temperature for strict structural adherence
         max_output_tokens=8192,        # Maximize context for large files
@@ -190,26 +223,26 @@ def main():
     print(f"Generating code... (Target: ./{args.outdir}/)")
     
     if args.iterative:
-        # Route to the new iterative pipeline
-        generate_iteratively(client, args.prompt, args.outdir, auto_save=args.yes)
+        # Route to the new iterative pipeline using the enriched prompt
+        generate_iteratively(client, final_prompt, args.outdir, auto_save=args.yes)
     else:
         # Standard Single-Shot pipeline
         try:
             response = client.models.generate_content(
                 model="gemini-2.5-flash",
-                contents=args.prompt,
+                contents=final_prompt,
                 config=config
             )
         except Exception as e:
             print(f"API Error: Request to Vertex AI failed. \nDetails: {e}")
             sys.exit(1)
 
-        # 4. Check for truncation before processing
+        # Check for truncation before processing
         if response.candidates[0].finish_reason != 'STOP':
             print(f"WARNING: Generation did not finish normally! Reason: {response.candidates[0].finish_reason}")
             print("Attempting to parse whatever was generated so far...")
         
-        # 5. Extract and save
+        # Extract and save
         extract_and_save_files(response.text, output_dir=args.outdir, auto_save=args.yes)
 
 if __name__ == "__main__":
