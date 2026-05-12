@@ -503,14 +503,37 @@ async fn main() -> Result<()> {
         }
     }
 
+    // Determine the centralized log directory (~/.coder/coder_api_usage.log)
+    let log_path = if let Some(mut path) = dirs::home_dir() {
+        path.push(".coder");
+        // Ensure the directory exists. We ignore the result here because if it fails,
+        // it will fail in the file creation below where we catch it cleanly.
+        let _ = fs::create_dir_all(&path);
+        path.push("coder_api_usage.log");
+        path
+    } else {
+        // Fallback to the current directory if we somehow can't get the user's home directory
+        PathBuf::from("coder_api_usage.log")
+    };
+
     // Set up file logger matching the Python format
     WriteLogger::init(
         LevelFilter::Info,
         ConfigBuilder::new()
             .set_time_format_custom(format_description!("[year]-[month]-[day] [hour]:[minute]:[second]"))
             .build(),
-        OpenOptions::new().append(true).create(true).open("coder_api_usage.log")?,
+        OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(&log_path)
+            .with_context(|| format!("Failed to open log file at {}", log_path.display()))?,
     )?;
+
+    // Optional: Let the user know where the log lives, assuming it's not a headless run
+    if !args.headless {
+        // We log to info so it goes into the file as well
+        info!("Logger initialized. Log path: {}", log_path.display());
+    }
 
     // Handle Input Context
     let mut context_data = String::new();
