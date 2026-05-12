@@ -84,6 +84,10 @@ struct Args {
     #[arg(short = 'y', long = "yes")]
     yes: bool,
 
+    /// Output structured JSON for editor integration
+    #[arg(long)]
+    headless: bool,
+
     /// Path to an exported codebase context file
     #[arg(long)]
     context_file: Option<String>,
@@ -221,7 +225,7 @@ async fn generate_with_tracking(
 
 // --- File Handling and Parsing ---
 
-fn extract_and_save_files(ai_response_text: &str, output_dir: &str, auto_save: bool) -> Result<()> {
+fn extract_and_save_files(ai_response_text: &str, output_dir: &str, auto_save: bool, headless: bool) -> Result<()> {
     let file_pattern = FILE_PATTERN.get_or_init(|| {
         Regex::new(r"(?s)<file name=\x22([^\x22]+)\x22(?:\s+action=\x22([^\x22]+)\x22)?>\s*(.*?)\s*</file>").unwrap()
     });
@@ -230,7 +234,15 @@ fn extract_and_save_files(ai_response_text: &str, output_dir: &str, auto_save: b
 
     // Phase 1: Apply all changes in-memory first
     for cap in file_pattern.captures_iter(ai_response_text) {
-        let filename = cap.get(1).map_or("", |m| m.as_str());
+        let raw_filename = cap.get(1).map_or("", |m| m.as_str());
+        
+        // Strip out leading paths like `./` or `/` to prevent messy `.join()` concatenations
+        let filename = raw_filename
+            .trim_start_matches("./")
+            .trim_start_matches(".\\")
+            .trim_start_matches('/')
+            .trim_start_matches('\\');
+
         let action = cap.get(2).map_or("write", |m| m.as_str()).to_lowercase();
         let content = cap.get(3).map_or("", |m| m.as_str());
         let file_path = Path::new(output_dir).join(filename);
@@ -304,6 +316,26 @@ fn extract_and_save_files(ai_response_text: &str, output_dir: &str, auto_save: b
         }
     }
 
+    if headless {
+        let ops: Vec<_> = memory_operations.iter().map(|op| {
+            json!({
+                "filename": op.filename,
+                "path": op.path.display().to_string(),
+                "action": op.action,
+                "new_text": op.new_text
+            })
+        }).collect();
+        
+        let out = json!({ "operations": ops });
+        
+        // Wrap JSON in delimiters so Neovim can easily extract it 
+        // regardless of any other log statements printed to stdout.
+        println!("===CODER_JSON_START===");
+        println!("{}", serde_json::to_string(&out).unwrap());
+        println!("===CODER_JSON_END===");
+        return Ok(());
+    }
+
     if memory_operations.is_empty() {
         println!("No successful file operations to apply.");
         return Ok(());
@@ -337,7 +369,7 @@ fn extract_and_save_files(ai_response_text: &str, output_dir: &str, auto_save: b
     }
 
     // Phase 3: Write to Disk
-    println!("\nApplying changes to './{}'...", output_dir);
+    println!("\nApplying changes to '{}'...", output_dir);
     for op in memory_operations {
         if let Some(parent) = op.path.parent() {
             fs::create_dir_all(parent)?;
@@ -357,6 +389,7 @@ async fn generate_iteratively(
     prompt: &str,
     output_dir: &str,
     auto_save: bool,
+    headless: bool,
 ) -> Result<()> {
     // Schema definition for Vertex AI Structured Output
     let schema_json = json!({
@@ -450,7 +483,7 @@ async fn generate_iteratively(
 
         let gen_text = file_resp["candidates"][0]["content"]["parts"][0]["text"].as_str().unwrap_or("");
         
-        if let Err(e) = extract_and_save_files(gen_text, output_dir, auto_save) {
+        if let Err(e) = extract_and_save_files(gen_text, output_dir, auto_save, headless) {
             println!("    Error applying changes to {}: {}", file_plan.filepath, e);
         }
 
@@ -501,10 +534,10 @@ async fn main() -> Result<()> {
     let token = get_gcloud_token()?;
     let client = reqwest::Client::new();
 
-    println!("Generating code... (Target: ./{}/)", args.outdir);
+    println!("Generating code... (Target: {})", args.outdir);
 
     if args.iterative {
-        generate_iteratively(&client, &token, &args.project, &final_prompt, &args.outdir, args.yes).await?;
+        generate_iteratively(&client, &token, &args.project, &final_prompt, &args.outdir, args.yes, args.headless).await?;
     } else {
         let payload = json!({
             "contents": [{"role": "user", "parts": [{"text": final_prompt}]}],
@@ -531,7 +564,7 @@ async fn main() -> Result<()> {
         }
 
         let gen_text = response["candidates"][0]["content"]["parts"][0]["text"].as_str().unwrap_or("");
-        extract_and_save_files(gen_text, &args.outdir, args.yes)?;
+        extract_and_save_files(gen_text, &args.outdir, args.yes, args.headless)?;
     }
 
     Ok(())
